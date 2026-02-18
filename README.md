@@ -57,11 +57,60 @@ action = model.select_action(obs)
 robot.send_action(action)
 ```
 
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1.
+**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1, SpaceMouse.
 
 While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
 
 For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
+
+### SpaceMouse Teleoperation
+
+You can use a [3Dconnexion SpaceMouse](https://www.3dconnexion.com/) to teleoperate robot arms with direct joint control — each SpaceMouse axis maps directly to a robot joint.
+
+**Installation:**
+
+```bash
+pip install -e ".[spacemouse]"
+```
+
+> [!NOTE]
+> On Linux you may need to set up udev rules for the SpaceMouse. See the [pyspacemouse docs](https://github.com/JakubAndrysek/PySpaceMouse#linux-permissions) for details.
+
+**Usage (direct joint control):**
+
+```bash
+lerobot-teleoperate \
+    --robot.type=so100_follower \
+    --robot.port=/dev/ttyACM0 \
+    --teleop.type=spacemouse \
+    --direct_joint.step_size=2.0 \
+    --debug=true
+```
+
+Passing any `--direct_joint.*` flag activates direct joint control mode. Each SpaceMouse axis controls one joint, and joint positions are clamped to the robot's calibrated physical limits.
+
+**Configuration options:**
+
+| Flag | Description | Default |
+|---|---|---|
+| `--direct_joint.step_size` | Degrees per tick at full deflection | `2.0` |
+| `--direct_joint.step_<joint>` | Per-joint step size override | global step_size |
+| `--direct_joint.map_<joint>` | Which SpaceMouse axis controls a joint (`x`, `y`, `z`, `roll`, `pitch`, `yaw`, `none`) | see below |
+| `--direct_joint.active_joints` | Comma-separated list of joints to enable (empty = all) | `""` |
+| `--debug` | Print joint positions, SpaceMouse axes, and timing info | `false` |
+
+**Default axis mapping:**
+
+| SpaceMouse axis | Robot joint |
+|---|---|
+| `yaw` (twist) | `shoulder_pan` |
+| `y` (push fwd/back) | `shoulder_lift` |
+| `z` (push up/down) | `elbow_flex` |
+| `pitch` (tilt fwd/back) | `wrist_flex` |
+| `roll` (tilt left/right) | `wrist_roll` |
+| Buttons | Gripper open/close |
+
+To invert an axis direction, negate the delta value in `teleop_spacemouse.py`'s `get_action()` method. To remap axes, modify the `map_*` defaults in `DirectJointConfig` or pass them as CLI flags.
 
 ## LeRobot Dataset
 
