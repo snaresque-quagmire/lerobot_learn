@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import logging
+import threading
+import time
 
 PYSPACEMOUSE_AVAILABLE = True
 try:
@@ -34,6 +36,10 @@ class SpaceMouseController:
 
     Handles opening/closing the device, reading state, applying deadzone filtering,
     and extracting button states.
+
+    A background thread continuously drains the HID buffer so that `update()`
+    always returns the freshest state instantly, regardless of how slow the
+    main loop is (e.g. during recording with cameras and dataset I/O).
 
     Compatible with pyspacemouse >= 2.0 (device-object API).
     """
@@ -60,9 +66,12 @@ class SpaceMouseController:
         self.rotation_sensitivity = rotation_sensitivity
         self._device = None
         self._state = None
+        self._lock = threading.Lock()
+        self._reader_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
-        """Open the SpaceMouse device."""
+        """Open the SpaceMouse device and start the background reader thread."""
         self._device = pyspacemouse.open()
         if self._device is None:
             raise ConnectionError(
@@ -70,10 +79,38 @@ class SpaceMouseController:
                 "and not being used by another application."
             )
         self._is_open = True
-        logging.info("SpaceMouse connected successfully.")
+        self._stop_event.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+        logging.info("SpaceMouse connected successfully (background reader started).")
+
+    def _reader_loop(self) -> None:
+        """Background thread: continuously read and drain the HID buffer."""
+        while not self._stop_event.is_set():
+            if self._device is None:
+                break
+            try:
+                state = self._device.read()
+                # Drain any remaining buffered reports
+                while True:
+                    next_state = self._device.read()
+                    if next_state.t == state.t:
+                        break
+                    state = next_state
+                with self._lock:
+                    self._state = state
+            except Exception:
+                # Device may have been closed; exit gracefully
+                break
+            # Small sleep to avoid busy-spinning while still being responsive
+            time.sleep(0.001)
 
     def stop(self) -> None:
-        """Close the SpaceMouse device and release resources."""
+        """Stop the background reader and close the SpaceMouse device."""
+        self._stop_event.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=2.0)
+            self._reader_thread = None
         if self._device is not None:
             self._device.close()
             self._device = None
@@ -84,24 +121,13 @@ class SpaceMouseController:
         return self._device is not None
 
     def update(self) -> None:
-        """Read the latest state from the SpaceMouse device.
+        """Snapshot the latest state from the background reader.
 
-        Drains all buffered HID reports so we always use the freshest data.
-        Without this, stale reports queue up in the USB buffer (especially
-        when the knob springs back to center) causing delayed response.
+        This is now essentially free — the background thread has already
+        drained the HID buffer and stored the freshest state.
         """
-        if self._device is None:
-            return
-        # Read once to get current state
-        state = self._device.read()
-        # Drain any remaining buffered reports — keep reading until
-        # the timestamp stops advancing (no more queued reports).
-        while True:
-            next_state = self._device.read()
-            if next_state.t == state.t:
-                break
-            state = next_state
-        self._state = state
+        # Nothing to do: _state is kept current by the reader thread.
+        pass
 
     def _apply_deadzone(self, value: float) -> float:
         """Zero out values below the deadzone threshold."""
@@ -117,12 +143,14 @@ class SpaceMouseController:
             Tuple of (delta_x, delta_y, delta_z) scaled by sensitivity.
             Values are in the range [-1.0, 1.0] * sensitivity.
         """
-        if self._state is None:
+        with self._lock:
+            state = self._state
+        if state is None:
             return (0.0, 0.0, 0.0)
 
-        dx = self._apply_deadzone(self._state.x) * self.translation_sensitivity
-        dy = self._apply_deadzone(self._state.y) * self.translation_sensitivity
-        dz = self._apply_deadzone(self._state.z) * self.translation_sensitivity
+        dx = self._apply_deadzone(state.x) * self.translation_sensitivity
+        dy = self._apply_deadzone(state.y) * self.translation_sensitivity
+        dz = self._apply_deadzone(state.z) * self.translation_sensitivity
 
         return (dx, dy, dz)
 
@@ -134,12 +162,14 @@ class SpaceMouseController:
             Tuple of (roll, pitch, yaw) scaled by rotation sensitivity.
             Values are in the range [-1.0, 1.0] * rotation_sensitivity.
         """
-        if self._state is None:
+        with self._lock:
+            state = self._state
+        if state is None:
             return (0.0, 0.0, 0.0)
 
-        roll = self._apply_deadzone(self._state.roll) * self.rotation_sensitivity
-        pitch = self._apply_deadzone(self._state.pitch) * self.rotation_sensitivity
-        yaw = self._apply_deadzone(self._state.yaw) * self.rotation_sensitivity
+        roll = self._apply_deadzone(state.roll) * self.rotation_sensitivity
+        pitch = self._apply_deadzone(state.pitch) * self.rotation_sensitivity
+        yaw = self._apply_deadzone(state.yaw) * self.rotation_sensitivity
 
         return (roll, pitch, yaw)
 
@@ -153,10 +183,12 @@ class SpaceMouseController:
         Returns:
             True if the button is pressed, False otherwise.
         """
-        if self._state is None:
+        with self._lock:
+            state = self._state
+        if state is None:
             return False
 
-        buttons = self._state.buttons
+        buttons = state.buttons
         if button_index < len(buttons):
             return bool(buttons[button_index])
         return False
