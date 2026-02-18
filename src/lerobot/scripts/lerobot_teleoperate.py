@@ -48,7 +48,6 @@ import rerun as rr
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
-from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.processor import (
     RobotAction,
@@ -83,7 +82,6 @@ from lerobot.teleoperators import (  # noqa: F401
     make_teleoperator_from_config,
     omx_leader,
     openarm_leader,
-    openarm_mini,
     reachy2_teleoperator,
     so_leader,
     spacemouse,
@@ -318,17 +316,10 @@ def teleop_loop(
     """Standard teleoperation loop with processor pipeline."""
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
+
     while True:
         loop_start = time.perf_counter()
         obs = robot.get_observation()
-<<<<<<< HEAD
-
-        if robot.name == "unitree_g1":
-            teleop.send_feedback(obs)
-
-        # Get teleop action
-=======
->>>>>>> 9bba271fd (add spacemouse for teleoperation)
         raw_action = teleop.get_action()
         teleop_action = teleop_action_processor((raw_action, obs))
         robot_action_to_send = robot_action_processor((teleop_action, obs))
@@ -379,13 +370,6 @@ def teleoperate(cfg: TeleoperateConfig):
 
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
-<<<<<<< HEAD
-
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors(
-        cfg.teleop, cfg.robot
-    )
-=======
->>>>>>> 9bba271fd (add spacemouse for teleoperation)
 
     teleop.connect()
     robot.connect()
