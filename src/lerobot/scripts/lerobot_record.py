@@ -26,10 +26,8 @@ lerobot-record \
     --dataset.repo_id=<my_username>/<my_dataset_name> \
     --dataset.num_episodes=2 \
     --dataset.single_task="Grab the cube" \
-    --dataset.streaming_encoding=true \
-    --dataset.encoder_threads=2 \
     --display_data=true
-    # <- Optional: specify video codec (auto, h264, hevc, libsvtav1). Default is libsvtav1. \
+    # <- Optional: specify video codec (h264, hevc, libsvtav1). Default is libsvtav1. \
     # --dataset.vcodec=h264 \
     # <- Teleop optional if you want to teleoperate to record or in between episodes with a policy \
     # --teleop.type=so100_leader \
@@ -60,10 +58,7 @@ lerobot-record \
   --display_data=true \
   --dataset.repo_id=${HF_USER}/bimanual-so-handover-cube \
   --dataset.num_episodes=25 \
-  --dataset.single_task="Grab and handover the red cube to the other arm" \
-  --dataset.streaming_encoding=true \
-  # --dataset.vcodec=auto \
-  --dataset.encoder_threads=2
+  --dataset.single_task="Grab and handover the red cube to the other arm"
 ```
 """
 
@@ -83,10 +78,10 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.datasets.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -125,12 +120,12 @@ from lerobot.teleoperators import (  # noqa: F401
     make_teleoperator_from_config,
     omx_leader,
     openarm_leader,
-    openarm_mini,
     reachy2_teleoperator,
     so_leader,
     unitree_g1,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
+from lerobot.scripts.lerobot_teleoperate import DirectJointConfig
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
@@ -139,10 +134,10 @@ from lerobot.utils.control_utils import (
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )
-from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
+    get_safe_torch_device,
     init_logging,
     log_say,
 )
@@ -155,7 +150,7 @@ class DatasetRecordConfig:
     repo_id: str
     # A short but accurate description of the task performed during the recording (e.g. "Pick the Lego block and drop it in the box on the right.")
     single_task: str
-    # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
+    # Root directory where the dataset will be stored (e.g. 'dataset/path').
     root: str | Path | None = None
     # Limit the frames per second.
     fps: int = 30
@@ -185,19 +180,9 @@ class DatasetRecordConfig:
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
-    # Video codec for encoding videos. Options: 'h264', 'hevc', 'libsvtav1', 'auto',
-    # or hardware-specific: 'h264_videotoolbox', 'h264_nvenc', 'h264_vaapi', 'h264_qsv'.
-    # Use 'auto' to auto-detect the best available hardware encoder.
+    # Video codec for encoding videos. Options: 'h264', 'hevc', 'libsvtav1'.
+    # Use 'h264' for faster encoding on systems where AV1 encoding is CPU-heavy.
     vcodec: str = "libsvtav1"
-    # Enable streaming video encoding: encode frames in real-time during capture instead
-    # of writing PNG images first. Makes save_episode() near-instant. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding
-    streaming_encoding: bool = False
-    # Maximum number of frames to buffer per camera when using streaming encoding.
-    # ~1s buffer at 30fps. Provides backpressure if the encoder can't keep up.
-    encoder_queue_maxsize: int = 30
-    # Number of threads per encoder instance. None = auto (codec default).
-    # Lower values reduce CPU usage, maps to 'lp' (via svtav1-params) for libsvtav1 and 'threads' for h264/hevc..
-    encoder_threads: int | None = None
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -226,6 +211,9 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Direct joint control (activate by passing any --direct_joint.* flag)
+    direct_joint: DirectJointConfig | None = None
+    max_gripper_pos: float = 100.0
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -274,6 +262,119 @@ class RecordConfig:
                                V
                   ( Rerun Log / Loop Wait )
 """
+
+
+@safe_stop_image_writer
+def direct_joint_record_loop(
+    robot: Robot,
+    teleop: Teleoperator,
+    djc: DirectJointConfig,
+    events: dict,
+    fps: int,
+    dataset: LeRobotDataset | None = None,
+    max_gripper_pos: float = 100.0,
+    control_time_s: int | None = None,
+    single_task: str | None = None,
+    display_data: bool = False,
+    display_compressed_images: bool = False,
+):
+    """Record loop for SpaceMouse direct joint control.
+
+    Accumulates SpaceMouse deltas into absolute joint positions (same as
+    direct_joint_teleop_loop in lerobot_teleoperate.py) and saves each
+    frame to the dataset.
+    """
+    if dataset is not None and dataset.fps != fps:
+        raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
+
+    axis_map = djc.get_axis_map()
+    logging.info("Direct joint record — active axis mapping:")
+    for axis_name, joint_name, step in axis_map:
+        logging.info(f"  SpaceMouse {axis_name:>5s} → {joint_name:<16s}  (step={step:.1f} deg/tick)")
+
+    # Initialize joint positions from current robot state
+    obs = robot.get_observation()
+    motor_names = list(robot.bus.motors.keys())
+    joint_positions = {}
+    for name in motor_names:
+        key = f"{name}.pos"
+        joint_positions[name] = float(obs[key]) if key in obs else 0.0
+
+    # Read joint limits from calibration (degrees)
+    joint_limits = {}
+    for motor in motor_names:
+        cal = robot.bus.calibration[motor]
+        model = robot.bus.motors[motor].model
+        max_res = robot.bus.model_resolution_table[model] - 1
+        mid = (cal.range_min + cal.range_max) / 2
+        min_deg = (cal.range_min - mid) * 360 / max_res
+        max_deg = (cal.range_max - mid) * 360 / max_res
+        joint_limits[motor] = (min(min_deg, max_deg), max(min_deg, max_deg))
+        logging.info(f"  {motor:<16s} limits: [{joint_limits[motor][0]:>7.1f}, {joint_limits[motor][1]:>7.1f}] deg")
+
+    gripper_pos = joint_positions.get("gripper", 0.0)
+    timestamp = 0
+    start_episode_t = time.perf_counter()
+
+    while timestamp < control_time_s:
+        start_loop_t = time.perf_counter()
+
+        if events["exit_early"]:
+            events["exit_early"] = False
+            break
+
+        # Get robot observation
+        obs = robot.get_observation()
+
+        if dataset is not None:
+            observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
+
+        # Get SpaceMouse deltas
+        raw_action = teleop.get_action()
+        axes = {
+            "x":     float(raw_action.get("delta_x", 0.0)),
+            "y":     float(raw_action.get("delta_y", 0.0)),
+            "z":     float(raw_action.get("delta_z", 0.0)),
+            "roll":  float(raw_action.get("delta_wx", 0.0)),
+            "pitch": float(raw_action.get("delta_wy", 0.0)),
+            "yaw":   float(raw_action.get("delta_wz", 0.0)),
+        }
+
+        # Accumulate into joint positions and clamp to limits
+        for axis_name, joint_name, step in axis_map:
+            val = axes.get(axis_name, 0.0)
+            if joint_name in joint_positions:
+                joint_positions[joint_name] += val * step
+                if joint_name in joint_limits:
+                    lo, hi = joint_limits[joint_name]
+                    joint_positions[joint_name] = max(lo, min(hi, joint_positions[joint_name]))
+
+        # Gripper via buttons
+        gripper_action = raw_action.get("gripper", 1)
+        if gripper_action == 2:    # OPEN
+            gripper_pos = min(gripper_pos + 2.0, max_gripper_pos)
+        elif gripper_action == 0:  # CLOSE
+            gripper_pos = max(gripper_pos - 2.0, 0.0)
+        joint_positions["gripper"] = gripper_pos
+
+        # Send to robot
+        action = {f"{name}.pos": val for name, val in joint_positions.items()}
+        _sent_action = robot.send_action(action)
+
+        # Write to dataset
+        if dataset is not None:
+            action_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
+            frame = {**observation_frame, **action_frame, "task": single_task}
+            dataset.add_frame(frame)
+
+        if display_data:
+            log_rerun_data(
+                observation=obs, action=action, compress_images=display_compressed_images
+            )
+
+        dt_s = time.perf_counter() - start_loop_t
+        precise_sleep(max(1 / fps - dt_s, 0.0))
+        timestamp = time.perf_counter() - start_episode_t
 
 
 @safe_stop_image_writer
@@ -334,7 +435,6 @@ def record_loop(
         preprocessor.reset()
         postprocessor.reset()
 
-    no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
@@ -369,8 +469,6 @@ def record_loop(
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
-            if robot.name == "unitree_g1":
-                teleop.send_feedback(obs)
             act = teleop.get_action()
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
@@ -384,13 +482,11 @@ def record_loop(
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
         else:
-            no_action_count += 1
-            if no_action_count == 1 or no_action_count % 10 == 0:
-                logging.warning(
-                    "No policy or teleoperator provided, skipping action generation. "
-                    "This is likely to happen when resetting the environment without a teleop device. "
-                    "The robot won't be at its rest position at the start of the next episode."
-                )
+            logging.info(
+                "No policy or teleoperator provided, skipping action generation."
+                "This is likely to happen when resetting the environment without a teleop device."
+                "The robot won't be at its rest position at the start of the next episode."
+            )
             continue
 
         # Applies a pipeline to the action, default is IdentityProcessor
@@ -419,14 +515,7 @@ def record_loop(
             )
 
         dt_s = time.perf_counter() - start_loop_t
-
-        sleep_time_s: float = 1 / fps - dt_s
-        if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
-
-        precise_sleep(max(sleep_time_s, 0.0))
+        precise_sleep(max(1 / fps - dt_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
 
@@ -446,9 +535,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors(
-        cfg.teleop, cfg.robot
-    )
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
@@ -475,9 +562,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 root=cfg.dataset.root,
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
-                streaming_encoding=cfg.dataset.streaming_encoding,
-                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
             )
 
             if hasattr(robot, "cameras") and len(robot.cameras) > 0:
@@ -500,9 +584,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
-                streaming_encoding=cfg.dataset.streaming_encoding,
-                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
             )
 
         # Load pretrained policy
@@ -526,40 +607,26 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener()
 
-        if not cfg.dataset.streaming_encoding:
-            logging.info(
-                "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
-            )
-
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    policy=policy,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                    display_compressed_images=display_compressed_images,
-                )
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
-
+                if cfg.direct_joint is not None:
+                    direct_joint_record_loop(
+                        robot=robot,
+                        teleop=teleop,
+                        djc=cfg.direct_joint,
+                        events=events,
+                        fps=cfg.dataset.fps,
+                        dataset=dataset,
+                        max_gripper_pos=cfg.max_gripper_pos,
+                        control_time_s=cfg.dataset.episode_time_s,
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
+                    )
+                else:
                     record_loop(
                         robot=robot,
                         events=events,
@@ -568,10 +635,52 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         robot_action_processor=robot_action_processor,
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
+                        policy=policy,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        dataset=dataset,
+                        control_time_s=cfg.dataset.episode_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
                     )
+
+                # Execute a few seconds without recording to give time to manually reset the environment
+                # Skip reset for the last episode to be recorded
+                if not events["stop_recording"] and (
+                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                ):
+                    log_say("Reset the environment", cfg.play_sounds)
+
+                    # reset g1 robot
+                    if robot.name == "unitree_g1":
+                        robot.reset()
+
+                    if cfg.direct_joint is not None:
+                        direct_joint_record_loop(
+                            robot=robot,
+                            teleop=teleop,
+                            djc=cfg.direct_joint,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            max_gripper_pos=cfg.max_gripper_pos,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                        )
+                    else:
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                        )
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
