@@ -162,9 +162,8 @@ class MapGamepadToJointPositionsStep(RobotActionProcessorStep):
     """
 
     motor_names: list[str]
-    joint_step_size: float = 3.0
+    joint_step_size: float = 10.0
     gripper_step_size: float = 5.0
-
     def action(self, action: RobotAction) -> RobotAction:
         observation = self.transition.get(TransitionKey.OBSERVATION).copy()
 
@@ -176,6 +175,7 @@ class MapGamepadToJointPositionsStep(RobotActionProcessorStep):
         delta_wrist_roll = float(action.pop("delta_wz", 0.0))
         gripper = float(action.pop("gripper", 1.0))  # 0=open, 1=close, 2=stay
 
+        
         joint_deltas = {
             "shoulder_pan": delta_shoulder_pan,
             "shoulder_lift": delta_shoulder_lift,
@@ -197,8 +197,15 @@ class MapGamepadToJointPositionsStep(RobotActionProcessorStep):
                     result[f"{name}.pos"] = current_pos
             else:
                 delta = joint_deltas.get(name, 0.0) * self.joint_step_size
-                result[f"{name}.pos"] = current_pos + delta
-
+                if delta != 0:
+                    result[f"{name}.pos"] = current_pos + delta
+                #result[f"{name}.pos"] += delta
+            #target = current_pos + delta * self.joint_step_size
+            #print(
+            #    f"[{name}] delta={delta:+.4f} | "
+            #    f"current={current_pos:.2f} | "
+            #    f"target={target:.2f}"
+            #)
         return result
 
     def transform_features(

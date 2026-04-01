@@ -277,6 +277,11 @@ class GamepadController(InputController):
                 elif event.button == 0:
                     self.episode_end_status = TeleopEvents.RERECORD_EPISODE
 
+                elif event.button == 4:
+                    self.wrist_roll_command = -1.0
+                elif event.button == 5:
+                    self.wrist_roll_command = 1.0
+
                 # RB button (6) for closing gripper
                 elif event.button == 6:
                     self.close_gripper_command = True
@@ -289,6 +294,9 @@ class GamepadController(InputController):
             elif event.type == pygame.JOYBUTTONUP:
                 if event.button in [0, 2, 3]:
                     self.episode_end_status = None
+
+                elif event.button in [4, 5]:
+                    self.wrist_roll_command = 0.0
 
                 elif event.button == 6:
                     self.close_gripper_command = False
@@ -313,12 +321,16 @@ class GamepadController(InputController):
             x_input = self.joystick.get_axis(1)  # Left/Right
 
             # Right stick Y (typically axis 3 or 4)
-            z_input = self.joystick.get_axis(3)  # Up/Down for Z
+            z_input = self.joystick.get_axis(4)  # Up/Down for Z
+            right_x_input  = self.joystick.get_axis(3)  # Up/Down for Z
 
             # Apply deadzone to avoid drift
             x_input = 0 if abs(x_input) < self.deadzone else x_input
             y_input = 0 if abs(y_input) < self.deadzone else y_input
             z_input = 0 if abs(z_input) < self.deadzone else z_input
+            right_x_input = 0 if abs(right_x_input) < self.deadzone else right_x_input
+
+            self.right_x = -right_x_input
 
             # Calculate deltas (note: may need to invert axes depending on controller)
             delta_x = -x_input * self.x_step_size  # Forward/backward
